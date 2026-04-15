@@ -79,7 +79,7 @@ openab-e2e test --thread 1493792852780519665 --channel 1493499891178016821
 openab-e2e test --test-name say_hi
 ```
 
-### Full suite (CI / cron)
+### Full suite (CI)
 
 ```bash
 # Runs all suites, exits non-zero on failure
@@ -107,14 +107,7 @@ TestCase {
 },
 ```
 
-## CI / Jenkins-like Setup
-
-### Cron job (macOS/Linux)
-
-```bash
-# Run every 5 minutes, log output
-*/5 * * * * /usr/local/bin/openab-e2e run-all >> /var/log/openab-e2e.log 2>&1
-```
+## CI / Jenkins Setup
 
 ### GitHub Actions
 
@@ -122,8 +115,7 @@ TestCase {
 name: E2E Bot Chain Test
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:
   workflow_dispatch:         # manual trigger
 
 jobs:
