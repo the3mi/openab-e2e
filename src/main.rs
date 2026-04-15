@@ -44,6 +44,10 @@ enum Commands {
         /// Run only a specific test by name
         #[arg(long)]
         test_name: Option<String>,
+
+        /// Send a webhook message to reset the bot-turn cap before testing
+        #[arg(long)]
+        reset_cap: bool,
     },
 
     /// Manage configuration
@@ -109,6 +113,7 @@ async fn main() -> Result<()> {
             channel,
             thread,
             test_name,
+            reset_cap,
         } => {
             let cfg = Config::load()
                 .or_else(|_| Config::init().map(|_| Config::load().unwrap()))
@@ -118,9 +123,17 @@ async fn main() -> Result<()> {
                 &cfg.discord.target_bot_id,
                 cfg.test.max_retries,
             )?;
-            let tester = Tester::new(discord);
 
+            // Reset bot-turn cap via webhook before testing
             let channel_id = channel.as_deref().unwrap_or(&cfg.discord.target_channel_id);
+            if *reset_cap {
+                println!("Resetting bot-turn cap via webhook...");
+                discord.send_webhook_cap_reset(channel_id).await
+                    .context("Failed to send cap-reset webhook")?;
+                println!("Cap reset sent.");
+            }
+
+            let tester = Tester::new(discord);
             let thread_id = thread.as_deref();
 
             let suites = test_cases::default_test_suites();

@@ -5,9 +5,9 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 /// How long to wait for 界王神 to respond to each message.
-const DEFAULT_TIMEOUT_SECS: u64 = 180;
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// How often to poll Discord while waiting.
-const POLL_INTERVAL_SECS: u64 = 5;
+const POLL_INTERVAL_SECS: u64 = 1;
 
 /// Result of a single test case run.
 #[derive(Debug)]
