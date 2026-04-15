@@ -56,13 +56,13 @@ pub fn default_test_suites() -> Vec<Vec<TestCase>> {
             },
             TestCase {
                 name: "who_are_you".into(),
-                prompt: "<@1491255095109746709> 請問你是誰".into(),
+                prompt: "<@TARGET_BOT_ID> 請問你是誰".into(),
                 expect_contains: vec!["界王神".into()],
                 expect_not_contains: vec![],
             },
             TestCase {
                 name: "model_version".into(),
-                prompt: "<@1491255095109746709> 請問你的模型是什麼".into(),
+                prompt: "<@TARGET_BOT_ID> 請問你的模型是什麼".into(),
                 expect_contains: vec!["claude-sonnet".into()],
                 expect_not_contains: vec![],
             },

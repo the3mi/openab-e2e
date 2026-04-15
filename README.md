@@ -1,13 +1,13 @@
 # openab-e2e
 
-Discord bot chain E2E tester: **ClawTriage → 界王神**
+Discord bot chain E2E tester for openab PR testing.
 
 ```
-ClawTriage (bot) ──REST API──▶ Discord ──WebSocket──▶ 界王神 (bot)
-                                      ▲
-                                      │ replies in Thread
-                                      │
-                              openab-e2e reads Thread
+devops-bot (tester) ──REST API──▶ Discord ──WebSocket──▶ openab-e2e-target (PR bot)
+                                            ▲
+                                            │ replies in Thread
+                                            │
+                                    openab-e2e reads Thread
 ```
 
 ## Architecture
@@ -39,11 +39,11 @@ Edit `~/.openab-e2e/config.toml`:
 
 ```toml
 [discord]
-bot_token = "YOUR_DISCORD_BOT_TOKEN"   # ClawTriage bot token
-target_bot_id = "1491255095109746709"   # 界王神's Discord user ID
-guild_id = "1320784060892708904"
-pr_channel_id = "1493499891178016821"   # PR channel (default test target)
-tiantian_channel_id = "1491375585124024440"  # 天庭
+bot_token = "YOUR_TESTER_BOT_TOKEN"   # Discord bot token for the tester bot (e.g. devops-bot)
+target_bot_id = "TARGET_BOT_ID"        # Discord user ID of the bot being tested (e.g. openab-e2e-target)
+guild_id = "YOUR_GUILD_ID"
+pr_channel_id = "PR_CHANNEL_ID"         # Discord channel ID for PR tests
+tiantian_channel_id = "TIANTIAN_CHANNEL_ID"  # Discord channel ID for 天庭 tests
 
 [test]
 timeout_secs = 180        # max wait for bot response per message
@@ -93,7 +93,7 @@ openab-e2e run-all --channel 1493499891178016821 --fail-fast
 | Name           | Prompt                                      | Expects          |
 |----------------|---------------------------------------------|------------------|
 | `say_hi`       | 請說 HI                                     | `HI`             |
-| `who_are_you`  | 請問你是誰                                  | `界王神`         |
+| `who_are_you`  | 請問你是誰                                  | `{BOT_NAME}`     |
 | `model_version`| 請問你的模型是什麼                           | `claude-sonnet`  |
 
 ## Adding New Test Cases

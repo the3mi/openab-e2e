@@ -85,11 +85,11 @@ impl Config {
 
         let template = Config {
             discord: DiscordConfig {
-                bot_token: "YOUR_BOT_TOKEN_HERE".to_string(),
-                target_bot_id: "1491255095109746709".to_string(),
-                guild_id: "1320784060892708904".to_string(),
-                pr_channel_id: "1493499891178016821".to_string(),
-                tiantian_channel_id: "1491375585124024440".to_string(),
+                bot_token: "YOUR_TESTER_BOT_TOKEN".to_string(),
+                target_bot_id: "TARGET_BOT_ID".to_string(),
+                guild_id: "YOUR_GUILD_ID".to_string(),
+                pr_channel_id: "PR_CHANNEL_ID".to_string(),
+                tiantian_channel_id: "TIANTIAN_CHANNEL_ID".to_string(),
             },
             test: TestConfig::default(),
         };
