@@ -30,21 +30,35 @@ pub struct SuiteResult {
 
 impl SuiteResult {
     pub fn summary(&self) -> String {
-        let status = if self.total_failed == 0 {
-            "✅ ALL PASSED"
-        } else {
-            "❌ SOME FAILED"
-        };
-        format!(
-            "{status} — {}/{} passed in suite '{}'",
+        let mut s = format!(
+            "\n\n{} — {} passed, {} failed in suite '{}'\n\n",
+            if self.total_passed == self.results.len() {
+                "✅ ALL PASSED"
+            } else {
+                "❌ SOME FAILED"
+            },
             self.total_passed,
-            self.results.len(),
+            self.total_failed,
             self.suite_name
-        )
+        );
+        for r in &self.results {
+            let icon = if r.passed { "✅" } else { "❌" };
+            s.push_str(&format!(
+                "  {} [{}] ({:.1}s)\n         {}\n",
+                icon,
+                r.test_name,
+                r.duration_secs,
+                r.error
+                    .as_ref()
+                    .map(|e| format!("Error: {}", e))
+                    .or_else(|| r.response.as_ref().map(|m| format!("Response: {}", m)))
+                    .unwrap_or_default()
+            ));
+        }
+        s
     }
 }
 
-/// The main test execution engine.
 pub struct Tester {
     discord: DiscordClient,
     timeout: Duration,
@@ -58,8 +72,17 @@ impl Tester {
         }
     }
 
-    /// Run all test cases in a suite, sending each as a separate message
-    /// to the given thread/channel and waiting for responses.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Run a suite of test cases against a target channel.
+    ///
+    /// All test cases share a single thread (created by the first test case).
+    /// - First test: send to main channel, bot creates thread
+    /// - Subsequent tests: send to the discovered thread
+    /// - All reads: from main channel (avoids thread 403 permission issues)
     pub async fn run_suite(
         &self,
         suite_name: &str,
@@ -68,22 +91,45 @@ impl Tester {
         thread_id: Option<&str>,
         bot_id: &str,
     ) -> Result<SuiteResult> {
-        let mut target = thread_id.unwrap_or(channel_id).to_string();
+        let main_channel_id = channel_id.to_string();
 
         info!(
             suite = suite_name,
-            target_channel = channel_id,
+            main_channel = %main_channel_id,
             target_thread = %thread_id.unwrap_or("(none)"),
             "Starting test suite"
         );
 
         let mut results = Vec::new();
+        let mut active_thread_id: Option<String> = thread_id.map(String::from);
 
         for (i, tc) in test_cases.iter().enumerate() {
             let resolved = tc.resolve(bot_id);
-            // Always send to the main channel — bot only monitors main channel for mentions
-            let (result, _) = self.run_single(&resolved, channel_id, i == 0).await;
+
+            // Where to send: thread if discovered, otherwise main channel
+            let target = active_thread_id.as_deref().unwrap_or(&main_channel_id);
+
+            let (result, discovered_thread) = self
+                .run_single(&resolved, target, &main_channel_id)
+                .await;
+
+            // After first test, capture the thread for subsequent tests
+            if i == 0 {
+                active_thread_id = discovered_thread;
+                if let Some(ref t) = active_thread_id {
+                    info!(
+                        "First test created thread {}. Subsequent tests will use this thread.",
+                        t
+                    );
+                }
+            }
+
             results.push(result);
+
+            // Delay between tests to avoid bot anti-spam
+            if i < test_cases.len() - 1 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
         }
 
         let total_passed = results.iter().filter(|r| r.passed).count();
@@ -97,14 +143,16 @@ impl Tester {
         })
     }
 
-    /// Run a single test case:
-    /// - Send the prompt to target channel/thread
-    /// - Wait for 界王神 to respond
-    /// - Validate the response
-    /// Returns (TestResult, discovered_thread_id)
-    async fn run_single(&self, tc: &TestCase, target: &str, _is_first: bool) -> (TestResult, Option<String>) {
+    /// Run a single test case.
+    /// Send to `target` (main channel or thread), read from `main_channel_id`.
+    async fn run_single(
+        &self,
+        tc: &TestCase,
+        target: &str,
+        main_channel_id: &str,
+    ) -> (TestResult, Option<String>) {
         let start = std::time::Instant::now();
-        info!(test = %tc.name, "Sending prompt");
+        info!(test = %tc.name, target, "Sending prompt");
 
         // Send the message
         let sent = match self.discord.send_message(target, &tc.prompt).await {
@@ -126,7 +174,13 @@ impl Tester {
         // Wait for 界王神 response
         let (response_msg, thread_id) = match self
             .discord
-            .wait_for_bot_response(target, &sent.id, self.timeout, Duration::from_secs(POLL_INTERVAL_SECS))
+            .wait_for_bot_response(
+                target,
+                &sent.id,
+                main_channel_id,
+                self.timeout,
+                Duration::from_secs(POLL_INTERVAL_SECS),
+            )
             .await
         {
             Ok((m, tid)) => (m, Some(tid)),
@@ -180,15 +234,42 @@ impl Tester {
         }
     }
 
-    /// Create a new thread in channel_id, send the first prompt there,
-    /// and return the thread's message ID (root of the thread).
-    pub async fn start_thread(
+    /// Run tests against an existing thread (all messages in same thread).
+    pub async fn run_suite_in_thread(
         &self,
-        channel_id: &str,
-        first_prompt: &str,
-    ) -> Result<(String, Message)> {
-        // Sending a message with a mention auto-creates a thread.
-        let msg = self.discord.send_message(channel_id, first_prompt).await?;
-        Ok((msg.id.clone(), msg))
+        suite_name: &str,
+        test_cases: &[TestCase],
+        thread_id: &str,
+        main_channel_id: &str,
+        bot_id: &str,
+    ) -> Result<SuiteResult> {
+        info!(
+            suite = suite_name,
+            thread_id,
+            main_channel_id,
+            "Starting test suite in existing thread"
+        );
+
+        let mut results = Vec::new();
+
+        for (i, tc) in test_cases.iter().enumerate() {
+            let resolved = tc.resolve(bot_id);
+            let (result, _) = self.run_single(&resolved, thread_id, main_channel_id).await;
+            results.push(result);
+
+            if i < test_cases.len() - 1 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+
+        let total_passed = results.iter().filter(|r| r.passed).count();
+        let total_failed = results.len() - total_passed;
+
+        Ok(SuiteResult {
+            suite_name: suite_name.to_string(),
+            results,
+            total_passed,
+            total_failed,
+        })
     }
 }

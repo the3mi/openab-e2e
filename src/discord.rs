@@ -1,22 +1,13 @@
 use anyhow::{bail, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 const DISCORD_API: &str = "https://discord.com/api/v10";
+const MAX_RETRIES: u32 = 3;
 
-/// Discord REST API client.
-pub struct DiscordClient {
-    client: reqwest::Client,
-    bot_token: String,
-    target_bot_id: String,
-    max_retries: u32,
-    /// Cached webhook for cap reset (id, token)
-    webhook: Mutex<Option<(String, String)>>,
-}
-
+/// Discord message with thread info.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Message {
     pub id: String,
@@ -28,6 +19,10 @@ pub struct Message {
     pub message_reference: Option<MessageReference>,
     #[serde(rename = "channel_id", default)]
     pub channel_id: String,
+    #[serde(rename = "edited_timestamp", default)]
+    pub edited_timestamp: Option<String>,
+    #[serde(rename = "last_message_id", default)]
+    pub last_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +44,10 @@ pub struct Author {
 pub struct ThreadInfo {
     pub id: String,
     pub name: String,
+    #[serde(rename = "last_message_id", default)]
+    pub last_message_id: Option<String>,
+    #[serde(rename = "parent_id", default)]
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +61,12 @@ pub struct Channel {
 #[derive(Debug, Serialize)]
 struct CreateMessage {
     content: String,
+}
+
+pub struct DiscordClient {
+    client: reqwest::Client,
+    target_bot_id: String,
+    max_retries: u32,
 }
 
 impl DiscordClient {
@@ -82,254 +87,287 @@ impl DiscordClient {
 
         Ok(Self {
             client,
-            bot_token: bot_token.to_string(),
             target_bot_id: target_bot_id.to_string(),
             max_retries,
-            webhook: Mutex::new(None),
         })
     }
 
-    /// Send a non-bot message to reset the bot-turn cap.
-    /// Uses a temporary webhook — webhook messages don't count as bot messages.
-    pub async fn send_webhook_cap_reset(&self, channel_id: &str) -> Result<()> {
-        // Get or create webhook
-        let (webhook_id, webhook_token) = {
-            let mut cache = self.webhook.lock().unwrap();
-            if let Some(ref c) = *cache {
-                c.clone()
-            } else {
-                // First, try to find an existing cap-reset webhook
-                let url = format!("{DISCORD_API}/channels/{channel_id}/webhooks");
-                let value: serde_json::Value = self
-                    .request_with_retry(|| self.client.get(&url).send())
-                    .await
-                    .context("Failed to list webhooks")?;
-                let webhooks = value.as_array().context("Expected webhook array")?;
-
-                if let Some(existing) = webhooks.iter().find(|w| {
-                    w.get("name").and_then(|n| n.as_str()).unwrap_or("") == "cap-reset"
-                    && !w.get("token").map(|t| t.is_null()).unwrap_or(true)
-                }) {
-                    let id = existing["id"].as_str().unwrap_or("").to_string();
-                    let token = existing["token"].as_str().unwrap_or("").to_string();
-                    *cache = Some((id.clone(), token.clone()));
-                    (id, token)
-                } else {
-                    // Create a new webhook
-                    let url = format!("{DISCORD_API}/channels/{channel_id}/webhooks");
-                    #[derive(Serialize)]
-                    struct CreateWebhook { name: String }
-                    let value: serde_json::Value = self
-                        .request_with_retry(|| {
-                            self.client.post(&url).json(&CreateWebhook { name: "cap-reset".into() }).send()
-                        })
-                        .await
-                        .context("Failed to create webhook")?;
-                    let id = value["id"].as_str().unwrap_or("").to_string();
-                    let token = value["token"].as_str().unwrap_or("").to_string();
-                    *cache = Some((id.clone(), token.clone()));
-                    (id, token)
-                }
-            }
+    /// Send a message to a channel or thread.
+    pub async fn send_message(&self, channel_or_thread_id: &str, content: &str) -> Result<Message> {
+        let url = format!("{}/channels/{}/messages", DISCORD_API, channel_or_thread_id);
+        let body = CreateMessage {
+            content: content.to_string(),
         };
 
-        // Use a simple POST without the generic retry wrapper (which expects JSON)
-        let url = format!("{DISCORD_API}/webhooks/{webhook_id}/{webhook_token}");
-        #[derive(Serialize)]
-        struct WebhookMsg { content: String }
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
-            .json(&WebhookMsg { content: "cap reset".into() })
+            .json(&body)
             .send()
-            .await
-            .context("Failed to send webhook HTTP request")?;
-
-        if !resp.status().is_success() {
-            bail!("Webhook POST failed: {}", resp.status());
-        }
-
-        info!("Sent webhook cap-reset to channel {}", channel_id);
-        Ok(())
-    }
-
-    /// Send a message to a channel or thread.
-    pub async fn send_message(&self, channel_id: &str, content: &str) -> Result<Message> {
-        let url = format!("{DISCORD_API}/channels/{channel_id}/messages");
-        let body = CreateMessage { content: content.to_string() };
-
-        let value = self
-            .request_with_retry(|| self.client.post(&url).json(&body).send())
             .await
             .context("Failed to send message")?;
 
-        let msg: Message = serde_json::from_value(value)
-            .context("Failed to parse message JSON")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to send message: {} — {body}", status);
+        }
 
-        info!(message_id = %msg.id, channel = channel_id, "Sent message");
+        let value: serde_json::Value = resp.json().await.context("Failed to parse response")?;
+        let msg: Message =
+            serde_json::from_value(value).context("Failed to parse message JSON")?;
+        info!(
+            message_id = %msg.id,
+            channel = %msg.channel_id,
+            "Sent message"
+        );
         Ok(msg)
     }
 
-    /// Fetch a single message by ID.
+    /// Fetch a single message from a channel.
     pub async fn get_message(&self, channel_id: &str, message_id: &str) -> Result<Message> {
-        let url = format!("{DISCORD_API}/channels/{channel_id}/messages/{message_id}");
-
-        let value = self
-            .request_with_retry(|| self.client.get(&url).send())
+        let url = format!("{}/channels/{}/messages/{}", DISCORD_API, channel_id, message_id);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
             .await
             .context("Failed to fetch message")?;
 
-        let msg: Message = serde_json::from_value(value)
-            .context("Failed to parse message JSON")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to fetch message {}: {} — {body}", message_id, status);
+        }
+
+        let value: serde_json::Value = resp.json().await.context("Failed to parse response")?;
+        let msg: Message =
+            serde_json::from_value(value).context("Failed to parse message JSON")?;
         Ok(msg)
     }
 
-    /// Fetch recent messages from a channel/thread, returns newest first.
+    /// Fetch recent messages from a channel.
     pub async fn get_messages(&self, channel_id: &str, limit: u8) -> Result<Vec<Message>> {
-        let url = format!("{DISCORD_API}/channels/{channel_id}/messages?limit={limit}");
-
-        let value = self
-            .request_with_retry(|| self.client.get(&url).send())
+        let url = format!(
+            "{}/channels/{}/messages?limit={}",
+            DISCORD_API,
+            channel_id,
+            limit.min(100)
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
             .await
             .context("Failed to fetch messages")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to fetch messages from {}: {} — {body}", channel_id, status);
+        }
+
+        let value: serde_json::Value = resp.json().await.context("Failed to parse response")?;
         let messages: Vec<Message> = serde_json::from_value(value)
             .context("Failed to parse messages JSON")?;
-
         debug!(channel = channel_id, count = messages.len(), "Fetched messages");
         Ok(messages)
     }
 
     /// Wait for a response from the target bot.
     ///
-    /// Strategy: Poll the sent message until Discord indexes its thread.
-    /// Then poll the thread DIRECTLY (not the sent message) for bot's response.
-    /// Returns (bot_response_message, thread_id)
+    /// Flow (ALWAYS reads from main channel to avoid thread 403):
+    /// 1. Poll the sent message until it has a thread (bot replied)
+    /// 2. Poll main channel messages for bot's reply (message_reference -> our message)
+    /// 3. Return the bot's message and thread_id
+    ///
+    /// `target` = where we sent the message (main channel or thread)
+    /// `sent_message_id` = the message we sent
+    /// `main_channel_id` = the parent channel (for reading messages)
     pub async fn wait_for_bot_response(
         &self,
-        channel_id: &str,
-        after_message_id: &str,
+        target: &str,
+        sent_message_id: &str,
+        main_channel_id: &str,
         timeout: Duration,
         poll_interval: Duration,
     ) -> Result<(Message, String)> {
         let start = tokio::time::Instant::now();
 
         info!(
-            channel = channel_id,
-            sent_msg_id = after_message_id,
+            target,
+            sent_msg_id = sent_message_id,
+            main_channel = main_channel_id,
             timeout_secs = timeout.as_secs(),
             "Waiting for bot response"
         );
 
-        // Phase 1: Poll the sent message until it gets a thread
-        let thread_id = loop {
+        // Phase 1: If target is main channel, wait for thread creation.
+        // If target is already a thread (subsequent tests), skip Phase 1.
+        let discovered_thread_id = if target == main_channel_id {
+            let discovered = loop {
+                if start.elapsed() > timeout {
+                    bail!(
+                        "Timeout after {}s — no thread for message {}",
+                        timeout.as_secs(),
+                        sent_message_id
+                    );
+                }
+
+                let msg = self.get_message(target, sent_message_id).await?;
+
+                if let Some(ref thread_info) = msg.thread {
+                    break thread_info.id.clone();
+                }
+
+                debug!("Sent message has no thread yet, polling...");
+                tokio::time::sleep(poll_interval).await;
+            };
+            info!(thread_id = %discovered, "Thread created by bot");
+            discovered
+        } else {
+            info!("Already in thread {}, skipping thread creation check", target);
+            target.to_string()
+        };
+
+        // Phase 2: Poll the thread for the bot's reply message.
+        // Bot replies IN THE THREAD it created, so we read from discovered_thread_id.
+        let bot_msg = loop {
             if start.elapsed() > timeout {
                 bail!(
-                    "Timeout after {}s — no thread for message {}",
+                    "Timeout after {}s — bot message not found in thread {}",
                     timeout.as_secs(),
-                    after_message_id
+                    discovered_thread_id
                 );
             }
 
-            let msg = self.get_message(channel_id, after_message_id).await?;
+            let messages = self.get_messages(&discovered_thread_id, 20).await?;
 
-            if let Some(ref thread_info) = msg.thread {
-                break thread_info.id.clone();
+            // Find the LATEST bot message that came AFTER our sent message (newer snowflake ID)
+            let found = messages.iter()
+                .filter(|msg| msg.author.id == self.target_bot_id && msg.id.as_str() > sent_message_id)
+                .max_by_key(|msg| msg.id.clone());
+
+            if let Some(msg) = found {
+                let c = msg.content.trim();
+                if c.is_empty() || c == "..." {
+                    debug!("Bot message still editing, retrying...");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                break msg.clone();
             }
 
-            debug!("Sent message has no thread yet, polling again...");
+            debug!("Bot reply not yet in thread, polling...");
             tokio::time::sleep(poll_interval).await;
         };
 
-        info!(thread_id = %thread_id, "Thread found, reading bot response from thread");
+        info!(
+            message_id = %bot_msg.id,
+            author = %bot_msg.author.username,
+            content = %bot_msg.content,
+            "Bot response found"
+        );
 
-        // Phase 2: Poll the thread directly for the bot's response
-        // Use the same start time for overall timeout
-        let bot_msg = self.wait_for_bot_text_in_thread(&thread_id, start, timeout, poll_interval).await?;
-        Ok((bot_msg, thread_id))
+        Ok((bot_msg, discovered_thread_id))
     }
 
-    /// Poll a thread until we find a bot message with actual text content.
-    async fn wait_for_bot_text_in_thread(
+    /// Create a webhook in a channel for cap reset.
+    pub async fn create_webhook(&self, channel_id: &str, name: &str) -> Result<Webhook> {
+        let url = format!("{}/channels/{}/webhooks", DISCORD_API, channel_id);
+        #[derive(Serialize)]
+        struct CreateWebhook {
+            name: String,
+        }
+        let resp = self
+            .client
+            .post(&url)
+            .json(&CreateWebhook {
+                name: name.to_string(),
+            })
+            .send()
+            .await
+            .context("Failed to create webhook")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to create webhook: {} — {body}", status);
+        }
+
+        let value: serde_json::Value = resp.json().await.context("Failed to parse webhook")?;
+        let webhook: Webhook =
+            serde_json::from_value(value).context("Failed to parse webhook JSON")?;
+        Ok(webhook)
+    }
+
+    /// Execute a webhook (send a message via webhook).
+    pub async fn execute_webhook(
         &self,
-        thread_id: &str,
-        start: tokio::time::Instant,
-        timeout: Duration,
-        poll_interval: Duration,
-    ) -> Result<Message> {
-        loop {
-            if start.elapsed() > timeout {
-                bail!(
-                    "Timeout after {}s waiting for bot response in thread {}",
-                    timeout.as_secs(),
-                    thread_id
-                );
-            }
-
-            let messages = self.get_messages(thread_id, 10).await?;
-
-            for msg in &messages {
-                if msg.author.id == self.target_bot_id && !msg.content.is_empty() {
-                    info!(
-                        message_id = %msg.id,
-                        author = %msg.author.username,
-                        content = %msg.content,
-                        "Bot response found"
-                    );
-                    return Ok(msg.clone());
-                }
-            }
-
-            debug!("No bot text in thread yet, polling again...");
-            tokio::time::sleep(poll_interval).await;
+        webhook_url: &str,
+        content: &str,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        struct ExecuteWebhook {
+            content: String,
         }
-    }
+        let resp = self
+            .client
+            .post(webhook_url)
+            .json(&ExecuteWebhook {
+                content: content.to_string(),
+            })
+            .send()
+            .await
+            .context("Failed to execute webhook")?;
 
-    /// Generic retry wrapper with exponential backoff.
-    async fn request_with_retry<F, Fut>(&self, make_request: F) -> Result<serde_json::Value>
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
-    {
-        let mut last_err = None;
-
-        for attempt in 0..=self.max_retries {
-            if attempt > 0 {
-                let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1));
-                warn!(attempt, delay_ms = delay.as_millis() as u64, "Retrying after error");
-                tokio::time::sleep(delay).await;
-            }
-
-            match make_request().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        let body = resp.text().await.context("Failed to read response body")?;
-                        let value: serde_json::Value =
-                            serde_json::from_str(&body).context("Failed to parse JSON response")?;
-                        return Ok(value);
-                    }
-
-                    if status.as_u16() == 429 {
-                        let body = resp.text().await.unwrap_or_default();
-                        warn!(status = 429, body = %body, "Rate limited");
-                        last_err = Some(anyhow::anyhow!("Rate limited (429): {body}"));
-                        continue;
-                    }
-
-                    if status.as_u16() == 401 || status.as_u16() == 403 {
-                        let body = resp.text().await.unwrap_or_default();
-                        bail!("Authentication error ({status}): {body}");
-                    }
-
-                    let body = resp.text().await.unwrap_or_default();
-                    last_err = Some(anyhow::anyhow!("HTTP {status}: {body}"));
-                }
-                Err(e) => {
-                    warn!(attempt, error = %e, "Request failed");
-                    last_err = Some(e.into());
-                }
-            }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to execute webhook: {} — {body}", status);
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Request failed after retries")))
+        Ok(())
     }
+
+    /// List webhooks in a channel.
+    pub async fn list_webhooks(&self, channel_id: &str) -> Result<Vec<Webhook>> {
+        let url = format!("{}/channels/{}/webhooks", DISCORD_API, channel_id);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to list webhooks")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to list webhooks: {} — {body}", status);
+        }
+
+        let value: serde_json::Value = resp.json().await.context("Failed to parse webhooks")?;
+        let webhooks: Vec<Webhook> =
+            serde_json::from_value(value).context("Failed to parse webhooks JSON")?;
+        Ok(webhooks)
+
+    }
+    /// Reset the bot-turn cap by posting via a temporary webhook in the channel.
+    pub async fn send_webhook_cap_reset(&self, channel_id: &str) -> Result<()> {
+        let webhooks = self.list_webhooks(channel_id).await?;
+        let webhook = webhooks
+            .iter()
+            .find(|w| w.name == "cap-reset" && !w.token.is_empty())
+            .context("No cap-reset webhook found")?;
+        let webhook_url = format!("{}/webhooks/{}/{}", DISCORD_API, webhook.id, webhook.token);
+        self.execute_webhook(&webhook_url, "cap reset").await?;
+        info!(channel = channel_id, "Sent webhook cap-reset to channel");
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, Deserialize)]
+pub struct Webhook {
+    pub id: String,
+    pub name: String,
+    pub token: String,
 }
