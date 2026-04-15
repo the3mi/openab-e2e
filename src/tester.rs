@@ -68,7 +68,7 @@ impl Tester {
         thread_id: Option<&str>,
         bot_id: &str,
     ) -> Result<SuiteResult> {
-        let target = thread_id.unwrap_or(channel_id);
+        let mut target = thread_id.unwrap_or(channel_id).to_string();
 
         info!(
             suite = suite_name,
@@ -81,9 +81,8 @@ impl Tester {
 
         for (i, tc) in test_cases.iter().enumerate() {
             let resolved = tc.resolve(bot_id);
-            let result = self
-                .run_single(&resolved, target, i == 0)
-                .await;
+            // Always send to the main channel — bot only monitors main channel for mentions
+            let (result, _) = self.run_single(&resolved, channel_id, i == 0).await;
             results.push(result);
         }
 
@@ -102,7 +101,8 @@ impl Tester {
     /// - Send the prompt to target channel/thread
     /// - Wait for 界王神 to respond
     /// - Validate the response
-    async fn run_single(&self, tc: &TestCase, target: &str, _is_first: bool) -> TestResult {
+    /// Returns (TestResult, discovered_thread_id)
+    async fn run_single(&self, tc: &TestCase, target: &str, _is_first: bool) -> (TestResult, Option<String>) {
         let start = std::time::Instant::now();
         info!(test = %tc.name, "Sending prompt");
 
@@ -110,32 +110,38 @@ impl Tester {
         let sent = match self.discord.send_message(target, &tc.prompt).await {
             Ok(m) => m,
             Err(e) => {
-                return TestResult {
-                    test_name: tc.name.clone(),
-                    passed: false,
-                    response: None,
-                    error: Some(format!("Send failed: {e}")),
-                    duration_secs: start.elapsed().as_secs_f64(),
-                };
+                return (
+                    TestResult {
+                        test_name: tc.name.clone(),
+                        passed: false,
+                        response: None,
+                        error: Some(format!("Send failed: {e}")),
+                        duration_secs: start.elapsed().as_secs_f64(),
+                    },
+                    None,
+                );
             }
         };
 
         // Wait for 界王神 response
-        let response_msg = match self
+        let (response_msg, thread_id) = match self
             .discord
             .wait_for_bot_response(target, &sent.id, self.timeout, Duration::from_secs(POLL_INTERVAL_SECS))
             .await
         {
-            Ok(m) => m,
+            Ok((m, tid)) => (m, Some(tid)),
             Err(e) => {
                 warn!(test = %tc.name, error = %e, "Timeout or error waiting for response");
-                return TestResult {
-                    test_name: tc.name.clone(),
-                    passed: false,
-                    response: None,
-                    error: Some(format!("Timeout: {e}")),
-                    duration_secs: start.elapsed().as_secs_f64(),
-                };
+                return (
+                    TestResult {
+                        test_name: tc.name.clone(),
+                        passed: false,
+                        response: None,
+                        error: Some(format!("Timeout: {e}")),
+                        duration_secs: start.elapsed().as_secs_f64(),
+                    },
+                    None,
+                );
             }
         };
 
@@ -146,24 +152,30 @@ impl Tester {
         match tc.validate(&response_text) {
             Ok(()) => {
                 info!(test = %tc.name, passed = true, "Test passed");
-                TestResult {
-                    test_name: tc.name.clone(),
-                    passed: true,
-                    response: Some(response_text),
-                    error: None,
-                    duration_secs: duration,
-                }
+                (
+                    TestResult {
+                        test_name: tc.name.clone(),
+                        passed: true,
+                        response: Some(response_text),
+                        error: None,
+                        duration_secs: duration,
+                    },
+                    thread_id,
+                )
             }
             Err(errors) => {
                 let error = errors.join("; ");
                 warn!(test = %tc.name, passed = false, error = %error, "Test failed validation");
-                TestResult {
-                    test_name: tc.name.clone(),
-                    passed: false,
-                    response: Some(response_text),
-                    error: Some(error),
-                    duration_secs: duration,
-                }
+                (
+                    TestResult {
+                        test_name: tc.name.clone(),
+                        passed: false,
+                        response: Some(response_text),
+                        error: Some(error),
+                        duration_secs: duration,
+                    },
+                    thread_id,
+                )
             }
         }
     }

@@ -24,6 +24,17 @@ pub struct Message {
     pub author: Author,
     #[serde(default)]
     pub thread: Option<ThreadInfo>,
+    #[serde(default)]
+    pub message_reference: Option<MessageReference>,
+    #[serde(rename = "channel_id", default)]
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageReference {
+    pub message_id: Option<String>,
+    #[serde(rename = "channel_id", default)]
+    pub channel_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,19 +98,38 @@ impl DiscordClient {
             if let Some(ref c) = *cache {
                 c.clone()
             } else {
+                // First, try to find an existing cap-reset webhook
                 let url = format!("{DISCORD_API}/channels/{channel_id}/webhooks");
-                #[derive(Serialize)]
-                struct CreateWebhook { name: String }
                 let value: serde_json::Value = self
-                    .request_with_retry(|| {
-                        self.client.post(&url).json(&CreateWebhook { name: "cap-reset".into() }).send()
-                    })
+                    .request_with_retry(|| self.client.get(&url).send())
                     .await
-                    .context("Failed to create webhook")?;
-                let id = value["id"].as_str().unwrap_or("").to_string();
-                let token = value["token"].as_str().unwrap_or("").to_string();
-                *cache = Some((id.clone(), token.clone()));
-                (id, token)
+                    .context("Failed to list webhooks")?;
+                let webhooks = value.as_array().context("Expected webhook array")?;
+
+                if let Some(existing) = webhooks.iter().find(|w| {
+                    w.get("name").and_then(|n| n.as_str()).unwrap_or("") == "cap-reset"
+                    && !w.get("token").map(|t| t.is_null()).unwrap_or(true)
+                }) {
+                    let id = existing["id"].as_str().unwrap_or("").to_string();
+                    let token = existing["token"].as_str().unwrap_or("").to_string();
+                    *cache = Some((id.clone(), token.clone()));
+                    (id, token)
+                } else {
+                    // Create a new webhook
+                    let url = format!("{DISCORD_API}/channels/{channel_id}/webhooks");
+                    #[derive(Serialize)]
+                    struct CreateWebhook { name: String }
+                    let value: serde_json::Value = self
+                        .request_with_retry(|| {
+                            self.client.post(&url).json(&CreateWebhook { name: "cap-reset".into() }).send()
+                        })
+                        .await
+                        .context("Failed to create webhook")?;
+                    let id = value["id"].as_str().unwrap_or("").to_string();
+                    let token = value["token"].as_str().unwrap_or("").to_string();
+                    *cache = Some((id.clone(), token.clone()));
+                    (id, token)
+                }
             }
         };
 
@@ -170,15 +200,16 @@ impl DiscordClient {
 
     /// Wait for a response from the target bot.
     ///
-    /// Strategy: Poll the sent message directly for a thread (bot creates thread on reply).
-    /// Then poll the thread for the bot's actual response text.
+    /// Strategy: Poll the sent message until Discord indexes its thread.
+    /// Then poll the thread DIRECTLY (not the sent message) for bot's response.
+    /// Returns (bot_response_message, thread_id)
     pub async fn wait_for_bot_response(
         &self,
         channel_id: &str,
         after_message_id: &str,
         timeout: Duration,
         poll_interval: Duration,
-    ) -> Result<Message> {
+    ) -> Result<(Message, String)> {
         let start = tokio::time::Instant::now();
 
         info!(
@@ -189,7 +220,7 @@ impl DiscordClient {
         );
 
         // Phase 1: Poll the sent message until it gets a thread
-        loop {
+        let thread_id = loop {
             if start.elapsed() > timeout {
                 bail!(
                     "Timeout after {}s — no thread for message {}",
@@ -201,16 +232,19 @@ impl DiscordClient {
             let msg = self.get_message(channel_id, after_message_id).await?;
 
             if let Some(ref thread_info) = msg.thread {
-                let thread_id = thread_info.id.clone();
-                info!(thread_id = %thread_id, "Thread found, reading bot response from thread");
-
-                // Phase 2: Poll the thread for the bot's actual response
-                return self.wait_for_bot_text_in_thread(&thread_id, start, timeout, poll_interval).await;
+                break thread_info.id.clone();
             }
 
             debug!("Sent message has no thread yet, polling again...");
             tokio::time::sleep(poll_interval).await;
-        }
+        };
+
+        info!(thread_id = %thread_id, "Thread found, reading bot response from thread");
+
+        // Phase 2: Poll the thread directly for the bot's response
+        // Use the same start time for overall timeout
+        let bot_msg = self.wait_for_bot_text_in_thread(&thread_id, start, timeout, poll_interval).await?;
+        Ok((bot_msg, thread_id))
     }
 
     /// Poll a thread until we find a bot message with actual text content.
