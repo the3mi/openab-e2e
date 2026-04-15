@@ -131,8 +131,15 @@ impl DiscordClient {
         Ok(messages)
     }
 
-    /// Wait for a response from the target bot in a thread/channel.
-    /// Returns the bot's response message, or error on timeout.
+    /// Wait for a response from the target bot.
+    ///
+    /// Strategy:
+    /// 1. Poll the main channel until we see the bot's reply
+    /// 2. If the bot's reply has a thread attached, switch to polling that thread
+    /// 3. Continue polling the thread until we find the bot's response to our message
+    ///
+    /// This handles the Discord quirk where sending a message to a channel does NOT
+    /// immediately create a thread — the thread is created when the bot replies.
     pub async fn wait_for_bot_response(
         &self,
         channel_id: &str,
@@ -149,6 +156,34 @@ impl DiscordClient {
             "Waiting for bot response"
         );
 
+        // Phase 1: Wait for bot reply in the main channel (may also give us a thread)
+        let bot_reply = self
+            .wait_for_bot_in_channel(channel_id, after_id, start, timeout, poll_interval)
+            .await?;
+
+        // Phase 2: If bot's reply has a thread, switch to reading the thread
+        if let Some(thread_info) = &bot_reply.thread {
+            let thread_id = &thread_info.id;
+            info!(thread_id = thread_id, "Switching to thread for response");
+
+            // Wait for the actual response IN the thread
+            return self
+                .wait_for_bot_in_channel(thread_id, 0, start, timeout, poll_interval)
+                .await;
+        }
+
+        Ok(bot_reply)
+    }
+
+    /// Poll a channel (or thread) looking for a message from the target bot.
+    async fn wait_for_bot_in_channel(
+        &self,
+        channel_id: &str,
+        after_id: u64,
+        start: tokio::time::Instant,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<Message> {
         loop {
             if start.elapsed() > timeout {
                 bail!(
@@ -172,7 +207,7 @@ impl DiscordClient {
                 }
             }
 
-            debug!("No response yet, polling again in {}ms", poll_interval.as_millis());
+            debug!("No response yet in {}, polling again in {}ms", channel_id, poll_interval.as_millis());
             tokio::time::sleep(poll_interval).await;
         }
     }
