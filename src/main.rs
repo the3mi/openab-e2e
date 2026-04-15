@@ -1,0 +1,216 @@
+mod config;
+mod discord;
+mod test_cases;
+mod tester;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use config::Config;
+use discord::DiscordClient;
+use std::path::PathBuf;
+use tester::Tester;
+use tracing::Level;
+use tracing_subscriber::FmtSubscriber;
+
+const DEFAULT_CHANNEL: &str = "1493499891178016821"; // PR channel
+const DEFAULT_TARGET_BOT: &str = "1491255095109746709"; // 界王神
+
+// ── CLI ─────────────────────────────────────────────────────────────────────
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "openab-e2e",
+    version = "0.1.0",
+    about = "Discord bot chain E2E tester: ClawTriage → 界王神"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+
+    /// Path to config file (default: ~/.openab-e2e/config.toml)
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Interactively test the bot chain
+    Test {
+        /// Discord channel ID to use (default: PR channel)
+        #[arg(short, long)]
+        channel: Option<String>,
+
+        /// Existing thread ID to use (default: create new thread)
+        #[arg(short, long)]
+        thread: Option<String>,
+
+        /// Run only a specific test by name
+        #[arg(long)]
+        test_name: Option<String>,
+    },
+
+    /// Manage configuration
+    Config {
+        #[command(subcommand)]
+        sub: ConfigCommands,
+    },
+
+    /// Run full test suites (for CI / cron)
+    RunAll {
+        /// Discord channel ID
+        #[arg(short, long)]
+        channel: Option<String>,
+
+        /// Exit with non-zero code if any test fails
+        #[arg(short = '1', long)]
+        fail_fast: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommands {
+    /// Print current configuration path and values
+    Show,
+    /// Create a new config file from template
+    Init,
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::INFO)
+        .with_target(false)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Commands::Config { sub } => match sub {
+            ConfigCommands::Show => {
+                let cfg = Config::load()
+                    .or_else(|_| Config::init().map(|_| Config::load().unwrap()))
+                    .context("Failed to load or create config")?;
+                println!("Discord bot token: {}...", cfg.discord.bot_token.chars().take(10).collect::<String>());
+                println!("Target bot ID: {}", cfg.discord.target_bot_id);
+                println!("PR channel: {}", cfg.discord.pr_channel_id);
+                println!("天庭 channel: {}", cfg.discord.tiantian_channel_id);
+                println!("Timeout: {}s", cfg.test.timeout_secs);
+                println!("Max retries: {}", cfg.test.max_retries);
+                Ok(())
+            }
+            ConfigCommands::Init => {
+                let path = Config::default_path()
+                    .context("Failed to get default config path")?;
+                Config::init()
+                    .context("Failed to init config")?;
+                println!("Config template written to: {}", path.display());
+                println!("Please edit the file and add your Discord bot token.");
+                Ok(())
+            }
+        },
+        Commands::Test {
+            channel,
+            thread,
+            test_name,
+        } => {
+            let cfg = Config::load()
+                .or_else(|_| Config::init().map(|_| Config::load().unwrap()))
+                .context("Failed to load or create config")?;
+            let discord = DiscordClient::new(
+                &cfg.discord.bot_token,
+                &cfg.discord.target_bot_id,
+                cfg.test.max_retries,
+            )?;
+            let tester = Tester::new(discord);
+
+            let channel_id = channel.as_deref().unwrap_or(&cfg.discord.pr_channel_id);
+            let thread_id = thread.as_deref();
+
+            let suites = test_cases::default_test_suites();
+            let mut all_passed = true;
+
+            for (i, suite) in suites.iter().enumerate() {
+                let suite_name = format!("suite-{}", i + 1);
+
+                // Filter by test_name if specified
+                let cases: Vec<_> = if let Some(name) = test_name {
+                    suite.iter().filter(|tc| tc.name == *name).cloned().collect()
+                } else {
+                    suite.to_vec()
+                };
+
+                if cases.is_empty() {
+                    continue;
+                }
+
+                let result = tester
+                    .run_suite(&suite_name, &cases, channel_id, thread_id)
+                    .await?;
+
+                print_suite_result(&result);
+
+                if result.total_failed > 0 {
+                    all_passed = false;
+                }
+            }
+
+            if !all_passed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Commands::RunAll {
+            channel,
+            fail_fast,
+        } => {
+            let cfg = Config::load()
+                .or_else(|_| Config::init().map(|_| Config::load().unwrap()))
+                .context("Failed to load or create config")?;
+            let discord = DiscordClient::new(
+                &cfg.discord.bot_token,
+                &cfg.discord.target_bot_id,
+                cfg.test.max_retries,
+            )?;
+            let tester = Tester::new(discord);
+
+            let channel_id = channel.as_deref().unwrap_or(&cfg.discord.pr_channel_id);
+
+            let suites = test_cases::default_test_suites();
+            let mut all_passed = true;
+
+            for (i, suite) in suites.iter().enumerate() {
+                let suite_name = format!("suite-{}", i + 1);
+                let result = tester.run_suite(&suite_name, suite, channel_id, None).await?;
+                print_suite_result(&result);
+                if result.total_failed > 0 {
+                    all_passed = false;
+                }
+            }
+
+            if !all_passed && *fail_fast {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn print_suite_result(result: &tester::SuiteResult) {
+    println!("\n{}", result.summary());
+    for r in &result.results {
+        let icon = if r.passed { "✅" } else { "❌" };
+        let status = if r.passed { "PASS" } else { "FAIL" };
+        println!("  {icon} [{status}] {} ({:.1}s)", r.test_name, r.duration_secs);
+        if let Some(err) = &r.error {
+            println!("         Error: {}", err);
+        }
+        if let Some(resp) = &r.response {
+            println!("         Response: {}", resp.trim());
+        }
+    }
+}
