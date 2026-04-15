@@ -12,16 +12,13 @@ use tester::Tester;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
-const DEFAULT_CHANNEL: &str = "1493499891178016821"; // PR channel
-const DEFAULT_TARGET_BOT: &str = "1491255095109746709"; // 界王神
-
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(
     name = "openab-e2e",
     version = "0.1.0",
-    about = "Discord bot chain E2E tester: ClawTriage → 界王神"
+    about = "Discord bot chain E2E tester for openab PR testing"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -34,13 +31,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Interactively test the bot chain
+    /// Run E2E tests against the target bot
     Test {
-        /// Discord channel ID to use (default: PR channel)
+        /// Discord channel ID (default: from config)
         #[arg(short, long)]
         channel: Option<String>,
 
-        /// Existing thread ID to use (default: create new thread)
+        /// Existing thread ID to continue conversation
         #[arg(short, long)]
         thread: Option<String>,
 
@@ -55,9 +52,9 @@ enum Commands {
         sub: ConfigCommands,
     },
 
-    /// Run full test suites (for CI / cron)
+    /// Run all test suites (for CI / cron)
     RunAll {
-        /// Discord channel ID
+        /// Discord channel ID (default: from config)
         #[arg(short, long)]
         channel: Option<String>,
 
@@ -69,7 +66,7 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
-    /// Print current configuration path and values
+    /// Show current configuration
     Show,
     /// Create a new config file from template
     Init,
@@ -95,19 +92,16 @@ async fn main() -> Result<()> {
                     .context("Failed to load or create config")?;
                 println!("Discord bot token: {}...", cfg.discord.bot_token.chars().take(10).collect::<String>());
                 println!("Target bot ID: {}", cfg.discord.target_bot_id);
-                println!("PR channel: {}", cfg.discord.pr_channel_id);
-                println!("天庭 channel: {}", cfg.discord.tiantian_channel_id);
+                println!("Target channel: {}", cfg.discord.target_channel_id);
                 println!("Timeout: {}s", cfg.test.timeout_secs);
                 println!("Max retries: {}", cfg.test.max_retries);
                 Ok(())
             }
             ConfigCommands::Init => {
-                let path = Config::default_path()
-                    .context("Failed to get default config path")?;
-                Config::init()
-                    .context("Failed to init config")?;
+                let path = Config::default_path().context("Failed to get default config path")?;
+                Config::init().context("Failed to init config")?;
                 println!("Config template written to: {}", path.display());
-                println!("Please edit the file and add your Discord bot token.");
+                println!("Please edit the file with your Discord IDs.");
                 Ok(())
             }
         },
@@ -126,7 +120,7 @@ async fn main() -> Result<()> {
             )?;
             let tester = Tester::new(discord);
 
-            let channel_id = channel.as_deref().unwrap_or(&cfg.discord.pr_channel_id);
+            let channel_id = channel.as_deref().unwrap_or(&cfg.discord.target_channel_id);
             let thread_id = thread.as_deref();
 
             let suites = test_cases::default_test_suites();
@@ -135,7 +129,6 @@ async fn main() -> Result<()> {
             for (i, suite) in suites.iter().enumerate() {
                 let suite_name = format!("suite-{}", i + 1);
 
-                // Filter by test_name if specified
                 let cases: Vec<_> = if let Some(name) = test_name {
                     suite.iter().filter(|tc| tc.name == *name).cloned().collect()
                 } else {
@@ -147,7 +140,7 @@ async fn main() -> Result<()> {
                 }
 
                 let result = tester
-                    .run_suite(&suite_name, &cases, channel_id, thread_id)
+                    .run_suite(&suite_name, &cases, channel_id, thread_id, &cfg.discord.target_bot_id)
                     .await?;
 
                 print_suite_result(&result);
@@ -176,14 +169,16 @@ async fn main() -> Result<()> {
             )?;
             let tester = Tester::new(discord);
 
-            let channel_id = channel.as_deref().unwrap_or(&cfg.discord.pr_channel_id);
+            let channel_id = channel.as_deref().unwrap_or(&cfg.discord.target_channel_id);
 
             let suites = test_cases::default_test_suites();
             let mut all_passed = true;
 
             for (i, suite) in suites.iter().enumerate() {
                 let suite_name = format!("suite-{}", i + 1);
-                let result = tester.run_suite(&suite_name, suite, channel_id, None).await?;
+                let result = tester
+                    .run_suite(&suite_name, suite, channel_id, None, &cfg.discord.target_bot_id)
+                    .await?;
                 print_suite_result(&result);
                 if result.total_failed > 0 {
                     all_passed = false;

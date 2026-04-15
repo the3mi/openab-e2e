@@ -66,6 +66,7 @@ impl Tester {
         test_cases: &[TestCase],
         channel_id: &str,
         thread_id: Option<&str>,
+        bot_id: &str,
     ) -> Result<SuiteResult> {
         let target = thread_id.unwrap_or(channel_id);
 
@@ -79,8 +80,9 @@ impl Tester {
         let mut results = Vec::new();
 
         for (i, tc) in test_cases.iter().enumerate() {
+            let resolved = tc.resolve(bot_id);
             let result = self
-                .run_single(tc, target, i == 0)
+                .run_single(&resolved, target, i == 0)
                 .await;
             results.push(result);
         }

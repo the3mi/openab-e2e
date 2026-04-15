@@ -15,6 +15,16 @@ pub struct TestCase {
 }
 
 impl TestCase {
+    /// Replace TARGET_BOT_ID placeholder with the actual bot ID.
+    pub fn resolve(&self, bot_id: &str) -> Self {
+        Self {
+            name: self.name.clone(),
+            prompt: self.prompt.replace("TARGET_BOT_ID", bot_id),
+            expect_contains: self.expect_contains.clone(),
+            expect_not_contains: self.expect_not_contains.clone(),
+        }
+    }
+
     /// Validate that a response contains expected patterns.
     pub fn validate(&self, response: &str) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();

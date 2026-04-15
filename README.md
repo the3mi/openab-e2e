@@ -39,11 +39,9 @@ Edit `~/.openab-e2e/config.toml`:
 
 ```toml
 [discord]
-bot_token = "YOUR_TESTER_BOT_TOKEN"   # Discord bot token for the tester bot (e.g. devops-bot)
-target_bot_id = "TARGET_BOT_ID"        # Discord user ID of the bot being tested (e.g. openab-e2e-target)
-guild_id = "YOUR_GUILD_ID"
-pr_channel_id = "PR_CHANNEL_ID"         # Discord channel ID for PR tests
-tiantian_channel_id = "TIANTIAN_CHANNEL_ID"  # Discord channel ID for 天庭 tests
+bot_token = "YOUR_TESTER_BOT_TOKEN"   # Discord bot token for the tester bot
+target_bot_id = "TARGET_BOT_ID"        # Discord user ID of the bot being tested
+target_channel_id = "TARGET_CHANNEL_ID" # Discord channel ID for tests
 
 [test]
 timeout_secs = 180        # max wait for bot response per message
